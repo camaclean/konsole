@@ -32,6 +32,9 @@
 
 #include <konsoledebug.h>
 
+using Konsole::TmuxNotificationKind;
+using Konsole::TmuxNotificationVariant;
+using Konsole::TmuxServerManager;
 using Konsole::Vt102Emulation;
 
 /*
@@ -56,7 +59,101 @@ unsigned short Konsole::vt100_graphics[32] = {
     0x23ba, 0x23bb, 0x2500, 0x23bc, 0x23bd, 0x251c, 0x2524, 0x2534,
     0x252c, 0x2502, 0x2264, 0x2265, 0x03C0, 0x2260, 0x00A3, 0x00b7
 };
-/* clang-format on */
+
+const QHash<QVector<uint>, TmuxNotificationKind>
+Konsole::tmuxCommandLookup = {
+    {QString("%begin").toUcs4(), TmuxNotificationKind::Response},
+    {QString("%end").toUcs4(), TmuxNotificationKind::End},
+    {QString("%error").toUcs4(), TmuxNotificationKind::Error},
+    {QString("%client-detached").toUcs4(), TmuxNotificationKind::ClientDetached},
+    {QString("%client-session-changed").toUcs4(), TmuxNotificationKind::ClientSessionChanged},
+    {QString("%config-error").toUcs4(), TmuxNotificationKind::ConfigError},
+    {QString("%continue").toUcs4(), TmuxNotificationKind::Continue},
+    {QString("%exit").toUcs4(), TmuxNotificationKind::Exit},
+    {QString("%extended-output").toUcs4(), TmuxNotificationKind::ExtendedOutput},
+    {QString("%layout-change").toUcs4(), TmuxNotificationKind::LayoutChange},
+    {QString("%message").toUcs4(), TmuxNotificationKind::Message},
+    {QString("%output").toUcs4(), TmuxNotificationKind::Output},
+    {QString("%pane-mode-changed").toUcs4(), TmuxNotificationKind::PaneModeChanged},
+    {QString("%paste-buffer-changed").toUcs4(), TmuxNotificationKind::PasteBufferChanged},
+    {QString("%paste-buffer-deleted").toUcs4(), TmuxNotificationKind::PasteBufferDeleted},
+    {QString("%pause").toUcs4(), TmuxNotificationKind::Pause},
+    {QString("%session-changed").toUcs4(), TmuxNotificationKind::SessionChanged},
+    {QString("%session-renamed").toUcs4(), TmuxNotificationKind::SessionRenamed},
+    {QString("%session-window-changed").toUcs4(), TmuxNotificationKind::SessionWindowChanged},
+    {QString("%sessions-changed").toUcs4(), TmuxNotificationKind::SessionsChanged},
+    {QString("%subscription-changed").toUcs4(), TmuxNotificationKind::SubscriptionChanged},
+    {QString("%unlinked-window-add").toUcs4(), TmuxNotificationKind::UnlinkedWindowAdd},
+    {QString("%unlinked-window-close").toUcs4(), TmuxNotificationKind::UnlinkedWindowClose},
+    {QString("%unlinked-window-renamed").toUcs4(), TmuxNotificationKind::UnlinkedWindowRenamed},
+    {QString("%window-add").toUcs4(), TmuxNotificationKind::WindowAdd},
+    {QString("%window-close").toUcs4(), TmuxNotificationKind::WindowClose},
+    {QString("%window-pane-changed").toUcs4(), TmuxNotificationKind::WindowPaneChanged},
+    {QString("%window-renamed").toUcs4(), TmuxNotificationKind::WindowRenamed},
+};
+
+template<typename Kind, typename Variant>
+struct VariantKindFactory;
+
+template<typename Kind, typename T>
+struct VariantKindBuilder
+{
+    template<typename Variant, typename... Args>
+    static void construct(Variant& v, Kind kind, Args&&... args)
+    {
+        if (kind == T::Kind) {
+            v.template emplace<T>(std::forward<Args>(args)...);
+        }
+    }
+};
+
+template<typename Kind>
+struct VariantKindBuilder<Kind, std::monostate>
+{
+    template<typename Variant, typename... Args>
+    static void construct(Variant&, Kind, Args&&...) {}
+};
+
+
+template<typename Kind, typename... Ts>
+struct VariantKindFactory<Kind, std::variant<Ts...>>
+{
+    template<typename... Args>
+    static std::variant<Ts...> create(Kind kind, Args&&... args)
+    {
+        std::variant<Ts...> ret;
+        (VariantKindBuilder<Kind, Ts>::construct(ret, kind, std::forward<Args>(args)...), ...);
+        return ret;
+    }
+};
+
+
+TmuxNotificationVariant makeNotification(TmuxNotificationKind kind)
+{
+    return VariantKindFactory<TmuxNotificationKind, TmuxNotificationVariant>::create(kind);
+}
+
+void TmuxServerManager::parseClientDetached(const QList<QVector<uint>>& args)
+{
+    Q_ASSERT(args.size() == 2);
+    emit clientDetached(QString::fromUcs4(args[1].data(), args[1].size()));
+}
+
+void TmuxServerManager::parseClientSessionChanged(const QList<QVector<uint>>& args)
+{
+    Q_ASSERT(args.size() >= 4);
+    QString client = QString::fromUcs4(args[1].data(), args[1].size());
+    int id = QString::fromUcs4(args[2].data(), args[2].size()).toInt();
+    QString name;
+    int i = 3;
+    for (; i < args.size()-1; ++i) {
+        name += QString::fromUcs4(args[i].data(), args[1].size());
+        name += ' ';
+    }
+    name += QString::fromUcs4(args[i].data(), args[1].size());
+    emit clientSessionChanged(client, id, name);
+}
+
 
 enum XTERM_EXTENDED {
     URL_LINK = '8',
@@ -66,6 +163,9 @@ Vt102Emulation::Vt102Emulation()
     : Emulation()
     , _currentModes(TerminalState())
     , _savedModes(TerminalState())
+    , _tmuxNotification{}
+    , _tmuxNotificationArgc(0)
+    , _tmuxServerManager(nullptr)
     , _pendingSessionAttributesUpdates(QHash<int, QString>())
     , _sessionAttributesUpdateTimer(new QTimer(this))
     , _reportFocusEvents(false)
@@ -616,6 +716,20 @@ void Vt102Emulation::put(const uint cc)
 
 void Vt102Emulation::hook(const uint cc)
 {
+    if (cc == 'p' && _nIntermediate == 0) {
+        if (params.value[0] == 1000) {
+            setMode(MODE_Tmux);
+
+            // We shouldn't be seeing this hook with a
+            // tmux server manager already started,
+            // but protect against spurious triggers
+            Q_ASSERT(!_tmuxServerManager);
+            if (!_tmuxServerManager) {
+                _tmuxServerManager = new TmuxServerManager;
+                emit tmuxControlModeDetected();
+            }
+        }
+    }
     if (cc == 'q' && _nIntermediate == 0) {
         m_SixelPictureDefinition = true;
         resetTokenizer();
@@ -682,9 +796,127 @@ void Vt102Emulation::apc_end()
     }
 }
 
-void Vt102Emulation::receiveChars(const QVector<uint> &chars)
+void Konsole::TmuxServerManager::commandResponse(const QList<QVector<uint>> &response)
 {
-    for (uint cc : chars) {
+}
+
+void Konsole::TmuxServerManager::commandError(const QList<QVector<uint>> &response)
+{
+    QString commandError{};
+    if (response.size() > 0) {
+        int i;
+        for (i = 0; i < response.size() - 1; ++i) {
+            commandError.append(QString::fromUcs4(response[i].data(), response[i].size()));
+            commandError.append('\n');
+        }
+        commandError.append(QString::fromUcs4(response[i].data(), response[i].size()));
+    }
+    qDebug() << "tmux error:\n" << commandError;
+}
+
+void Vt102Emulation::tmux_reset_notification()
+{
+    _tmuxCommandNotification.clear();
+    _tmuxCommandNotification.push_back({});
+}
+
+void Vt102Emulation::tmux_reset_response()
+{
+    _tmuxCommandResponse.clear();
+    _tmuxCommandResponse.push_back({});
+}
+
+void Vt102Emulation::tmux_lex(const uint cc)
+{
+    if (cc == '\n') {
+        std::visit(
+            [this](auto &arg) {
+                using T = std::remove_cv_t<std::remove_reference_t<decltype(arg)>>;
+                if constexpr (std::is_same_v<T, TmuxResponseNotification>) {
+                    auto &responseNotification = static_cast<TmuxResponseNotification &>(arg);
+                    if (responseNotification.state != TmuxResponseNotification::End && responseNotification.state != TmuxResponseNotification::Error) {
+                        // Keep reading response. Don't execute yet.
+                        return;
+                    }
+                }
+                arg.execute(*_tmuxServerManager);
+                _tmuxNotificationVariant = TmuxNullNotification{};
+            },
+            _tmuxNotificationVariant);
+        _state = TmuxRead;
+    } else if (cc == ' ' && _state == TmuxRead) {
+        // Tmux command mode doesn't escape or quote arguments with spaces,
+        // so defer tokenization to be command specific. Just check for the
+        // first space.
+        if (auto it = tmuxCommandLookup.find(_tmuxNotificationLine); it != tmuxCommandLookup.end()) {
+            std::visit(
+                [&, this](auto &arg) {
+                    using T = std::remove_cv_t<std::remove_reference_t<decltype(arg)>>;
+                    if constexpr (std::is_same_v<T, TmuxResponseNotification>) {
+                        auto &responseNotification = static_cast<TmuxResponseNotification &>(arg);
+                        switch (it.value()) {
+                        case TmuxNotificationKind::End:
+                            responseNotification.state = TmuxResponseNotification::End;
+                            break;
+                        case TmuxNotificationKind::Error:
+                            responseNotification.state = TmuxResponseNotification::Error;
+                            break;
+                        default:
+                            responseNotification.commandResponse.push_back(std::move(_tmuxNotificationLine));
+                            _tmuxNotificationLine = {};
+                            break;
+                        }
+                    } else if constexpr (std::is_same_v<T, TmuxNullNotification>) {
+                        _tmuxNotificationVariant = makeNotification(it.value());
+                        Q_ASSERT(_tmuxNotificationVariant.index() != 0);
+                    } else {
+                        qDebug() << "Invalid tmux parser state " << (int)T::Kind;
+                    }
+                    _state = TmuxConsume;
+                },
+                _tmuxNotificationVariant);
+        } else {
+            std::visit(
+                [&, this](auto &arg) {
+                    using T = std::remove_cv_t<std::remove_reference_t<decltype(arg)>>;
+                    if constexpr (std::is_same_v<T, TmuxResponseNotification>) {
+                        auto &responseNotification = static_cast<TmuxResponseNotification &>(arg);
+                        // We didn't read %end or %error, so we are reading a response.
+                        _tmuxNotificationLine.push_back(cc);
+                        responseNotification.commandResponse.push_back(std::move(_tmuxNotificationLine));
+                        responseNotification.state = TmuxResponseNotification::Response;
+                        _tmuxNotificationLine = {};
+                        _state = TmuxConsume;
+                    } else {
+                        qDebug() << "Unknown tmux notification " << _tmuxNotificationLine;
+                        _tmuxNotificationLine = {};
+                        _state = TmuxError;
+                    }
+                },
+                _tmuxNotificationVariant);
+        }
+    } else if (_state == TmuxRead) {
+        _tmuxNotificationLine.push_back(cc);
+    } else if (_state == TmuxConsume) {
+        std::visit(
+            [&](auto &arg) {
+                arg.push_char(cc);
+            },
+            _tmuxNotificationVariant);
+    }
+}
+
+void Vt102Emulation::receiveChars(const QVector<uint> &chars, int start, int end)
+{
+    if (end == -1)
+        end = chars.size();
+    for (int i = start; i < end; ++i) {
+        uint cc = chars[i];
+        if (getMode(MODE_Tmux)) {
+            tmux_lex(cc);
+            continue;
+        }
+
         // early out for displayable characters
         if (_state == Ground && ((cc >= 0x20 && cc <= 0x7E) || cc >= 0xA0)) {
             _currentScreen->displayCharacter(applyCharset(cc));

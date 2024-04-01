@@ -11,6 +11,7 @@
 
 // Qt
 #include <QKeyEvent>
+#include <QMessageBox>
 
 // Konsole
 #include "Screen.h"
@@ -185,9 +186,12 @@ QString Emulation::keyBindings() const
 
 // process application unicode input to terminal
 // this is a trivial scanner
-void Emulation::receiveChars(const QVector<uint> &chars)
+void Emulation::receiveChars(const QVector<uint> &chars, int start, int end)
 {
-    for (uint c : chars) {
+    if (end == -1)
+        end = chars.size();
+    for (int i = start; i < end; ++i) {
+        uint c = chars[i];
         c &= 0xff;
         switch (c) {
         case '\b':
