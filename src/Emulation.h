@@ -285,6 +285,13 @@ Q_SIGNALS:
     void zmodemUploadDetected();
 
     /**
+     * Emitted when the tmux command mode control sequence is detected.
+     */
+    void tmuxControlModeDetected();
+    void tmuxControlModeResponse(const QList<QVector<uint>> &);
+    void tmuxControlModeResponseError(const QList<QVector<uint>> &);
+
+    /**
      * This is emitted when the program (typically editors and other full-screen
      * applications, ones that take up the whole terminal display), running in
      * the terminal indicates whether or not it is interested in Mouse Tracking
@@ -431,7 +438,7 @@ protected:
      * Processes an incoming character.  See receiveData()
      * @p c A unicode character code.
      */
-    virtual void receiveChars(const QVector<uint> &c);
+    virtual void receiveChars(const QVector<uint> &c, int start = 0, int end = -1);
 
     /**
      * Sets the active screen.  The terminal has two screens, primary and alternate.
@@ -467,6 +474,8 @@ protected:
     QStringEncoder _encoder;
 
     const KeyboardTranslator *_keyTranslator = nullptr; // the keyboard layout
+
+    bool _tmuxMode = false;
 
 protected Q_SLOTS:
     /**
