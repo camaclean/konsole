@@ -85,9 +85,9 @@ private:
     bool blockFurtherProcessing = false;
 
 public:
-    void receiveChars(const QVector<uint> &c) override
+    void receiveChars(const QVector<uint> &c, int start = 0, int end = -1) override
     {
-        Vt102Emulation::receiveChars(c);
+        Vt102Emulation::receiveChars(c, start, end);
     }
 
 public:

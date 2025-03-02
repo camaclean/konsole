@@ -215,6 +215,9 @@ set(konsoleprivate_SRCS ${windowadaptors_SRCS}
                         terminalDisplay/TerminalFonts.cpp
                         terminalDisplay/TerminalBell.cpp
 
+                        tmux/TmuxLayout.cpp
+                        tmux/TmuxServerManager.cpp
+
                         profile/Profile.cpp
                         profile/ProfileCommandParser.cpp
                         profile/ProfileGroup.cpp
